@@ -1,0 +1,404 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.0;
+
+contract PayrollDApp {
+    // --- Structs ---
+    struct Employee {
+        bool isPartTime;
+        uint256 hourlyRate;
+        uint256 workingHours;
+        uint256 otRate;
+        uint256 otHours;
+        uint256 bonus;
+        uint256 deduction;
+    }
+
+    struct SalaryTransaction {
+        uint256 txid;
+        address employee;
+        uint256 amount;
+        uint256 releaseTime;
+        TimelockStatus status; // Queued, Cancelled, Executed
+        bool processed;
+        string description;
+    }
+
+    enum TimelockStatus { Queued, Cancelled, Executed }
+
+    // --- State Variables ---
+    address public owner;
+    uint256 public txCounter; 
+    mapping(address => bool) public employers;
+    mapping(address => mapping(address => Employee)) public employerEmployees;
+    mapping(address => mapping(address => bool)) public employerToEmployee;
+    mapping(address => mapping(uint256 => SalaryTransaction)) public salaryTransactions;
+    mapping(address => uint256) public employerBalances;
+    mapping(address => address[]) public employerEmployeeList;
+
+    // --- Events ---
+    event EmployerFunded(address indexed employer, uint256 amount);
+    event EmployeeAdded(address indexed employer, address indexed employee);
+    event SalaryPaid(address indexed employer, address indexed employee, uint256 amount);
+    event SalaryTimelockSet(address indexed employer, address indexed employee, uint256 releaseTime, uint256 txid);
+    event SalaryTimelockModified(address indexed employer, address indexed employee, uint256 txid, uint256 salary, uint256 releaseTime);
+    event SalaryTimelockDeleted(uint256 txid);
+
+    // --- Modifiers ---
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not authorized");
+        _;
+    }
+
+    modifier onlyEmployer() {
+        require(employers[msg.sender], "Not an employer");
+        _;
+    }
+
+    modifier onlyQueued(uint256 _txid) {
+        require(salaryTransactions[msg.sender][_txid].status == TimelockStatus.Queued, "Timelock is not queued");
+        _;
+    }
+
+    // --- Constructor ---
+    constructor() {
+        owner = msg.sender;
+    }
+
+    // --- Employer Functions ---
+    function registerEmployer() external {
+        require(!employers[msg.sender], "Already registered as an employer");
+        employers[msg.sender] = true;
+    }
+
+    function fundEmployer() external payable onlyEmployer {
+        require(msg.value > 0, "Must send Ether to fund account");
+        employerBalances[msg.sender] += msg.value;
+        emit EmployerFunded(msg.sender, msg.value);
+    }
+
+    function withdrawFunds(uint256 amount) external onlyEmployer {
+        require(employerBalances[msg.sender] >= amount, "Insufficient funds");
+        require(amount > 0, "Amount must be greater than zero");
+
+        employerBalances[msg.sender] -= amount;
+        payable(msg.sender).transfer(amount);
+    }
+
+    // --- Employee Management ---
+    function addEmployee(
+        address _employee,
+        bool _isPartTime,
+        uint256 _hourlyRate,
+        uint256 _workingHours,
+        uint256 _otRate,
+        uint256 _otHours,
+        uint256 _bonus,
+        uint256 _deduction
+    ) external onlyEmployer {
+        require(_employee != address(0) && _employee != msg.sender, "Invalid employee");
+        require(!employerToEmployee[msg.sender][_employee], "Employee already added");
+
+        employerEmployees[msg.sender][_employee] = Employee({
+            isPartTime: _isPartTime,
+            hourlyRate: _hourlyRate,
+            workingHours: _workingHours,
+            otRate: _otRate,
+            otHours: _otHours,
+            bonus: _bonus,
+            deduction: _deduction
+        });
+
+        employerToEmployee[msg.sender][_employee] = true;
+        employerEmployeeList[msg.sender].push(_employee);
+
+        emit EmployeeAdded(msg.sender, _employee);
+    }
+
+        // Modify an employee's details
+    function modifyEmployeeDetails(
+        address _employee,
+        bool _isPartTime,
+        uint256 _hourlyRate,
+        uint256 _workingHours,
+        uint256 _otRate,
+        uint256 _otHours,
+        uint256 _bonus,
+        uint256 _deduction
+    ) external onlyEmployer {
+        require(employerToEmployee[msg.sender][_employee], "Employee not found");
+
+        employerEmployees[msg.sender][_employee] = Employee({
+            isPartTime: _isPartTime,
+            hourlyRate: _hourlyRate,
+            workingHours: _workingHours,
+            otRate: _otRate,
+            otHours: _otHours,
+            bonus: _bonus,
+            deduction: _deduction
+        });
+    }
+
+    // Delete an employee's details
+    function deleteEmployee(address _employee) external onlyEmployer {
+        require(employerToEmployee[msg.sender][_employee], "Employee not found");
+
+        // Remove the employee details
+        delete employerEmployees[msg.sender][_employee];
+
+        // Mark the relationship as non-existent
+        employerToEmployee[msg.sender][_employee] = false;
+
+        // Remove the employee from the employer's employee list
+        address[] storage employeeList = employerEmployeeList[msg.sender];
+        for (uint256 i = 0; i < employeeList.length; i++) {
+            if (employeeList[i] == _employee) {
+                employeeList[i] = employeeList[employeeList.length - 1]; // Replace with the last employee
+                employeeList.pop(); // Remove the last element
+                break;
+            }
+        }
+    }
+
+    // --- Timelock Functions ---
+    function setSalaryTimelock(address _employee, uint256 _releaseTime) external onlyEmployer {
+        require(employerToEmployee[msg.sender][_employee], "Employee not found");
+
+        uint256 salary = calculateSalary(msg.sender, _employee);
+
+        txCounter++;
+        salaryTransactions[msg.sender][txCounter] = SalaryTransaction({
+            txid: txCounter,
+            employee: _employee,
+            amount: salary,
+            releaseTime: _releaseTime,
+            status: TimelockStatus.Queued,
+            processed: false,
+            description: "Salary timelock"
+        });
+
+        emit SalaryTimelockSet(msg.sender, _employee, _releaseTime, txCounter);
+    }
+
+    function setSalaryTimelockForAll(uint256 _releaseTime) external onlyEmployer {
+        address[] memory employees = employerEmployeeList[msg.sender];
+        for (uint256 i = 0; i < employees.length; i++) {
+            uint256 salary = calculateSalary(msg.sender, employees[i]);
+
+            txCounter++;
+            salaryTransactions[msg.sender][txCounter] = SalaryTransaction({
+                txid: txCounter,
+                employee: employees[i],
+                amount: salary,
+                releaseTime: _releaseTime,
+                status: TimelockStatus.Queued,
+                processed: false,
+                description: "Salary timelock for all employees"
+            });
+            emit SalaryTimelockSet(msg.sender, employees[i], _releaseTime, txCounter);
+        }
+    }
+
+    function checkSalaryTimelocks() external view onlyEmployer returns (SalaryTransaction[] memory) {
+        SalaryTransaction[] memory timelocks = new SalaryTransaction[](txCounter);
+        uint256 index = 0;
+        for (uint256 i = 1; i <= txCounter; i++) {
+            timelocks[index] = salaryTransactions[msg.sender][i];
+            index++;
+        }
+        return timelocks;
+    }
+
+    function viewQueuedTimelocks() 
+        external 
+        view 
+        onlyEmployer 
+        returns (
+            uint256[] memory, 
+            address[] memory, 
+            uint256[] memory, 
+            uint256[] memory
+        ) 
+    {
+        return filterTimelocksByStatus(TimelockStatus.Queued);
+    }
+
+    function viewExecutedTimelocks() 
+        external 
+        view 
+        onlyEmployer 
+        returns (
+            uint256[] memory, 
+            address[] memory, 
+            uint256[] memory, 
+            uint256[] memory
+        ) 
+    {
+        return filterTimelocksByStatus(TimelockStatus.Executed);
+    }
+
+    function viewCancelledTimelocks() 
+        external 
+        view 
+        onlyEmployer 
+        returns (
+            uint256[] memory, 
+            address[] memory, 
+            uint256[] memory, 
+            uint256[] memory
+        ) 
+    {
+        return filterTimelocksByStatus(TimelockStatus.Cancelled);
+    }
+
+    function modifyTimelock(uint256 _txid, uint256 _amount, uint256 _releaseTime) external onlyEmployer onlyQueued(_txid) {
+        SalaryTransaction storage txRecord = salaryTransactions[msg.sender][_txid];
+        txRecord.amount = _amount;
+        txRecord.releaseTime = _releaseTime;
+
+        emit SalaryTimelockModified(msg.sender, txRecord.employee, _txid, _amount, _releaseTime);
+    }
+
+    function deleteTimelock(uint256 _txid) external onlyEmployer onlyQueued(_txid) {
+        salaryTransactions[msg.sender][_txid].status = TimelockStatus.Cancelled;
+        emit SalaryTimelockDeleted(_txid);
+    }
+
+    // --- Payment Functions ---
+    function payIndividualSalary(uint256 _txid) external onlyEmployer onlyQueued(_txid) {
+        SalaryTransaction storage txRecord = salaryTransactions[msg.sender][_txid];
+        require(block.timestamp >= txRecord.releaseTime, "Timelock not passed");
+        require(!txRecord.processed, "Salary already processed");
+
+        require(employerBalances[msg.sender] >= txRecord.amount, "Insufficient funds");
+        payable(txRecord.employee).transfer(txRecord.amount);
+        employerBalances[msg.sender] -= txRecord.amount;
+
+        txRecord.status = TimelockStatus.Executed;
+        txRecord.processed = true;
+
+        emit SalaryPaid(msg.sender, txRecord.employee, txRecord.amount);
+    }
+
+    function payAllSalaries() external onlyEmployer {
+        uint256 totalSalary = 0;
+        uint256 count = 0;
+
+        // Calculate total salary and validate processable timelocks
+        for (uint256 i = 1; i <= txCounter; i++) {
+            SalaryTransaction storage txRecord = salaryTransactions[msg.sender][i];
+            if (txRecord.status == TimelockStatus.Queued && block.timestamp >= txRecord.releaseTime && !txRecord.processed) {
+                totalSalary += txRecord.amount;
+                count++;
+            }
+        }
+
+        require(employerBalances[msg.sender] >= totalSalary, "Insufficient funds");
+
+        // Process payments
+        for (uint256 i = 1; i <= txCounter; i++) {
+            SalaryTransaction storage txRecord = salaryTransactions[msg.sender][i];
+            if (txRecord.status == TimelockStatus.Queued && block.timestamp >= txRecord.releaseTime && !txRecord.processed) {
+                payable(txRecord.employee).transfer(txRecord.amount);
+                employerBalances[msg.sender] -= txRecord.amount;
+                txRecord.status = TimelockStatus.Executed;
+                txRecord.processed = true;
+                emit SalaryPaid(msg.sender, txRecord.employee, txRecord.amount);
+            }
+        }
+    }
+
+    function filterTimelocksByStatus(TimelockStatus _status) 
+        internal 
+        view 
+        returns (
+            uint256[] memory, 
+            address[] memory, 
+            uint256[] memory, 
+            uint256[] memory
+        ) 
+    {
+        uint256 count = 0;
+
+        // Count matching timelocks first
+        for (uint256 i = 1; i <= txCounter; i++) {
+            if (salaryTransactions[msg.sender][i].status == _status) {
+                count++;
+            }
+        }
+
+        // Prepare filtered arrays
+        uint256[] memory txids = new uint256[](count);
+        address[] memory employees = new address[](count);
+        uint256[] memory amounts = new uint256[](count);
+        uint256[] memory releaseTimes = new uint256[](count);
+
+        uint256 index = 0;
+
+        // Collect matching timelocks
+        for (uint256 i = 1; i <= txCounter; i++) {
+            SalaryTransaction storage txRecord = salaryTransactions[msg.sender][i];
+            if (txRecord.status == _status) {
+                txids[index] = txRecord.txid;
+                employees[index] = txRecord.employee;
+                amounts[index] = txRecord.amount;
+                releaseTimes[index] = txRecord.releaseTime;
+                index++;
+            }
+        }
+
+        return (txids, employees, amounts, releaseTimes);
+    }
+
+    function calculateSalary(address _employer, address _employee) public view returns (uint256) {
+        Employee memory employee = employerEmployees[_employer][_employee];
+        uint256 grossSalary;
+
+        if (employee.isPartTime) {
+            grossSalary = employee.hourlyRate * employee.workingHours;
+            return grossSalary;
+        } else {
+            grossSalary = (employee.hourlyRate * employee.workingHours) +
+                        (employee.otRate * employee.otHours) +
+                        employee.bonus;
+
+            uint256 epfDeduction = (grossSalary * 11) / 100;
+            uint256 socsoDeduction = (grossSalary * 2) / 100;
+            uint256 incomeTaxDeduction = (grossSalary * 10) / 100;
+
+            uint256 totalDeductions = epfDeduction + socsoDeduction + incomeTaxDeduction + employee.deduction;
+
+            return grossSalary - totalDeductions;
+        }
+    }
+
+    // Retrieve employee list for an employer
+    function checkEmployeeList(address _employer) public view returns (address[] memory) {
+        return employerEmployeeList[_employer];
+    }
+
+    // Retrieve employer balance
+    function getEmployerBalance(address _employer) external view returns (uint256) {
+        return employerBalances[_employer];
+    }
+
+    // --- Fallback Function ---
+    receive() external payable {}
+
+    function getAllEmployees()
+        public
+        view
+        onlyEmployer
+        returns (Employee[] memory)
+    {
+        address[] memory employees = employerEmployeeList[msg.sender];
+        uint256 count = employees.length;
+
+        Employee[] memory employeeDetails = new Employee[](count);
+
+        for (uint256 i = 0; i < count; i++) {
+            employeeDetails[i] = employerEmployees[msg.sender][employees[i]];
+        }
+
+        return employeeDetails;
+    }
+}
